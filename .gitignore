@@ -1,0 +1,20 @@
+# === 必须忽略的敏感文件 ===
+config.py
+local_mail.db
+
+# === 系统自动生成的文件 (垃圾文件) ===
+__pycache__/
+*.pyc
+.DS_Store
+
+# === 如果你有使用虚拟环境 ===
+venv/
+env/
+.env
+
+# === 编辑器配置 ===
+.vscode/
+.idea/config.py
+local_mail.db
+__pycache__/
+.DS_Store
