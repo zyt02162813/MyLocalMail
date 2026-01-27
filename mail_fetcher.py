@@ -1,5 +1,5 @@
 # mail_fetcher.py
-# V16.5 - Fix: 修复 Teams/腾讯会议 链接解析 (HTML反转义 + 长链接支持)
+# V27.1 - Fix: 修复 hashlib 缺失导致无法保存会议的 Bug
 import sqlite3
 import imaplib
 import email
@@ -8,11 +8,11 @@ from datetime import datetime, timedelta
 import os
 import uuid
 import re 
-import hashlib
 import config
-import html  # 🔥 核心引入：用于处理 URL 中的 &amp; 等转义符
+import html 
+import socket
+import hashlib  # <--- 补上了这关键的一行！
 
-# 尝试导入 icalendar
 try:
     import icalendar
     HAS_ICAL = True
@@ -20,7 +20,8 @@ except ImportError:
     HAS_ICAL = False
     print("❌ 警告：未安装 icalendar 库")
 
-FETCH_LIMIT = 30
+# 限制扫描最新的 30 封
+FETCH_LIMIT = 30 
 ATTACHMENT_DIR = "attachments"
 
 if not os.path.exists(ATTACHMENT_DIR):
@@ -56,7 +57,6 @@ def format_size(size_bytes):
         else: return f"{s/1048576:.1f}MB"
     except: return "0B"
 
-# === 1. 标准 ICS 解析 ===
 def format_ics_time(dt_obj):
     if dt_obj is None: return ""
     if hasattr(dt_obj, 'dt'): dt_obj = dt_obj.dt
@@ -82,74 +82,40 @@ def extract_ics_data(msg_content):
     except: pass
     return None
 
-# === 2. 🔥 正文智能提取 (Fix: 增强链接清洗) ===
 def extract_meeting_from_text(subject, raw_text):
-    """
-    raw_text: 原始邮件内容 (HTML/Text)
-    """
-    info = {
-        "uid": "",
-        "summary": subject, 
-        "start_time": "",
-        "end_time": "",
-        "location": "",
-        "description": "" 
-    }
-
-    # --- A. 提取链接 ---
-    # 策略：匹配以 http 开头，直到遇到 空格、引号、尖括号 为止的字符串
+    info = {"uid": "", "summary": subject, "start_time": "", "end_time": "", "location": "", "description": ""}
     link_patterns = [
-        # 1. Teams Launcher (复杂长链接, 含 ?, =, %, &)
         r'(https?://teams\.microsoft(?:online)?\.(?:com|cn)/dl/launcher/launcher\.html\?[^\s"\'<>]+)',
-        # 2. Teams 常规
         r'(https?://teams\.microsoft(?:online)?\.(?:com|cn)/[^\s"\'<>]+)',
-        # 3. 腾讯会议 (精准匹配 /dm/ 短链 和 普通链接)
-        r'(https?://meeting\.tencent\.com/[^\s"\'<>]+)',
-        r'(https?://voovmeeting\.com/[^\s"\'<>]+)',
-        # 4. Zoom
-        r'(https?://\w+\.zoom\.us/[^\s"\'<>]+)'
+        r'(https?://(?:meeting\.tencent\.com|voovmeeting\.com)/[A-Za-z0-9/_?=&%.-]+)',
+        r'(https?://\w+\.zoom\.us/[A-Za-z0-9/_?=&%.-]+)'
     ]
-    
     for pat in link_patterns:
         match = re.search(pat, raw_text)
         if match:
-            # 🔥 核心修复：HTML 反转义
-            # 邮件里的链接可能是 "launcher.html?url=...&amp;type=..."
-            # 必须转回 "&" 才能访问
-            extracted_url = match.group(1)
-            info["location"] = html.unescape(extracted_url)
+            info["location"] = html.unescape(match.group(1))
             break
-
-    # --- B. 提取时间 ---
     clean_text = re.sub(r'<[^>]+>', ' ', raw_text) 
     info["description"] = clean_text[:200].strip()
-
     date_part = r'\d{4}[-/年]\d{1,2}[-/月]\d{1,2}'
     time_part = r'\d{1,2}:\d{2}'
-    
-    strong_pattern = rf'(?:会议时间|Meeting Time)[：:]\s*({date_part}.*?{time_part})'
-    weak_pattern = rf'(?<!发送)(?<!Sent\s)(?<!Date:\s)(?:时间|Time)[：:]\s*({date_part}.*?{time_part})'
-
-    match = re.search(strong_pattern, clean_text, re.IGNORECASE)
-    if not match:
-        match = re.search(weak_pattern, clean_text, re.IGNORECASE)
-        
+    strong = rf'(?:会议时间|Meeting Time)[：:]\s*({date_part}.*?{time_part})'
+    weak = rf'(?<!发送)(?<!Sent\s)(?<!Date:\s)(?:时间|Time)[：:]\s*({date_part}.*?{time_part})'
+    match = re.search(strong, clean_text, re.IGNORECASE)
+    if not match: match = re.search(weak, clean_text, re.IGNORECASE)
     if match:
-        raw_time = match.group(1).strip()
         try:
-            nums = re.findall(r'\d+', raw_time)
+            nums = re.findall(r'\d+', match.group(1).strip())
             if len(nums) >= 5: 
-                year, month, day, hour, minute = map(int, nums[:5])
-                start_dt = datetime(year, month, day, hour, minute)
-                info["start_time"] = start_dt.strftime("%Y-%m-%d %H:%M")
-                info["end_time"] = (start_dt + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+                y, m, d, h, mn = map(int, nums[:5])
+                s_dt = datetime(y, m, d, h, mn)
+                info["start_time"] = s_dt.strftime("%Y-%m-%d %H:%M")
+                info["end_time"] = (s_dt + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
         except: pass
-
     if info["start_time"]:
         seed = f"{info['summary']}_{info['start_time']}"
         info["uid"] = hashlib.md5(seed.encode()).hexdigest()
         return info
-    
     return None
 
 def save_attachment(payload, filename):
@@ -160,61 +126,65 @@ def save_attachment(payload, filename):
         return os.path.abspath(file_path)
     except: return ""
 
-def fetch_mail(init_mode=False):
+def fetch_mail(init_mode=False, callback=None):
     conn = sqlite3.connect('local_mail.db'); c = conn.cursor()
     new_count = 0
     
-    try: 
-        c.execute("SELECT count(*) FROM emails"); 
-        if c.fetchone()[0] == 0: init_mode = True
-    except: init_mode = True
+    if callback: callback(0, "🚀 准备连接服务器...")
 
-    print(f"🔄 开始接收邮件 (最近 {FETCH_LIMIT} 封)...")
-
-    for acc in config.ACCOUNTS:
+    # 遍历所有账号
+    total_accounts = len(config.ACCOUNTS)
+    
+    for idx, acc in enumerate(config.ACCOUNTS):
         try:
-            print(f"📡 连接 {acc['email']}...")
+            acc_name = acc.get('name', acc['email'])
+            base_progress = int((idx / total_accounts) * 100)
+            
+            if callback: callback(base_progress + 2, f"📡 连接 [{idx+1}/{total_accounts}]: {acc_name}")
+            
+            socket.setdefaulttimeout(15)
             mail = imaplib.IMAP4_SSL(acc['imap_server'], acc['imap_port'])
             mail.login(acc['email'], acc['password']); mail.select("INBOX")
             
-            if init_mode:
-                status, messages = mail.search(None, 'ALL')
-                ids = messages[0].split()
-                mail_ids = ids[-FETCH_LIMIT:] if len(ids) > FETCH_LIMIT else ids
-            else:
-                status, messages = mail.search(None, 'UNSEEN')
-                mail_ids = messages[0].split()
+            # 搜索 ALL (含已读)
+            status, messages = mail.search(None, 'ALL')
+            ids = messages[0].split()
+            
+            # 截取最后30封
+            mail_ids = ids[-FETCH_LIMIT:] if len(ids) > FETCH_LIMIT else ids
+            total_mails = len(mail_ids)
+            
+            print(f"\n--- 账号 {acc_name}: 扫描最新 {total_mails} 封邮件 ---")
 
-            for num in reversed(mail_ids):
+            for i, num in enumerate(reversed(mail_ids)):
+                step_progress = base_progress + int((i / total_mails) * (100 / total_accounts))
+                if callback: callback(step_progress, f"📥 {acc_name}: 邮件 {i+1}/{total_mails}")
+
                 try:
                     status, msg_data = mail.fetch(num, '(RFC822)')
                     for response_part in msg_data:
                         if isinstance(response_part, tuple):
                             msg = email.message_from_bytes(response_part[1])
                             msg_id = msg.get("Message-ID", "").strip() or str(num)
+                            subj = decode_str(msg["Subject"])
                             
                             c.execute("SELECT id FROM emails WHERE message_id=?", (msg_id,))
                             if c.fetchone(): continue 
 
-                            subj = decode_str(msg["Subject"])
-                            sender = decode_str(msg["From"])
-                            recip = decode_str(msg["To"])
-                            cc = decode_str(msg["Cc"])
+                            sender = decode_str(msg["From"]); recip = decode_str(msg["To"]); cc = decode_str(msg["Cc"])
                             date = parse_date(msg["Date"])
-
                             body_t = ""; body_h = ""; atts = []; ics_data = None
                             
                             if msg.is_multipart():
                                 for part in msg.walk():
-                                    ctype = part.get_content_type()
-                                    fname = part.get_filename()
+                                    ctype = part.get_content_type(); fname = part.get_filename()
                                     try: payload = part.get_payload(decode=True)
                                     except: continue
                                     if not payload: continue
 
                                     if ctype == "text/calendar" or (fname and fname.lower().endswith(".ics")):
-                                        if not ics_data: ics_data = extract_ics_data(payload)
-
+                                        if HAS_ICAL: ics_data = extract_ics_data(payload)
+                                    
                                     if ctype == "text/plain" and not fname: body_t += payload.decode(errors='ignore')
                                     elif ctype == "text/html" and not fname: body_h += payload.decode(errors='ignore')
                                     elif fname:
@@ -233,22 +203,26 @@ def fetch_mail(init_mode=False):
                                 search_text = body_h if body_h else body_t 
                                 ics_data = extract_meeting_from_text(subj, search_text)
 
-                            c.execute('''INSERT INTO emails (account_email, message_id, subject, sender, recipient, cc, date_received, body_html, body_text, attachments, folder)
-                                         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inbox')''',
-                                      (acc['email'], msg_id, subj, sender, recip, cc, date, body_h, body_t, ";".join(atts)))
+                            c.execute('''INSERT INTO emails (account_email, message_id, subject, sender, recipient, cc, date_received, body_html, body_text, attachments, folder) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inbox')''', (acc['email'], msg_id, subj, sender, recip, cc, date, body_h, body_t, ";".join(atts)))
                             new_count += 1
                             
                             if ics_data and ics_data['uid']:
+                                print(f"   ✅ 发现会议: {ics_data['summary']}")
                                 c.execute("SELECT id FROM events WHERE uid=?", (ics_data['uid'],))
                                 if not c.fetchone():
-                                    c.execute("INSERT INTO events (uid, summary, start_time, end_time, location, description, sender, recipient, minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')",
-                                              (ics_data['uid'], ics_data['summary'], ics_data['start_time'], ics_data['end_time'], ics_data['location'], ics_data['description'], sender, recip))
-
+                                    c.execute("INSERT INTO events (uid, summary, start_time, end_time, location, description, sender, recipient, minutes) VALUES (?, ?, ?, ?, ?, ?, ?, ?, '')", (ics_data['uid'], ics_data['summary'], ics_data['start_time'], ics_data['end_time'], ics_data['location'], ics_data['description'], sender, recip))
+                            
                             conn.commit()
-                except Exception as e: print(f"解析错误: {e}"); continue
+                except Exception as e:
+                    print(f"   ❌ 出错: {e}")
+                    continue
             mail.logout()
-        except Exception as e: print(f"连接错误: {e}")
+        except Exception as e: 
+            if callback: callback(100, f"⚠️ 网络错误: {e}")
+            print(f"连接错误: {e}")
+            
     conn.close()
+    if callback: callback(100, f"✅ 完成: 新增 {new_count} 封")
     return new_count
 
 if __name__ == "__main__": fetch_mail(init_mode=True)

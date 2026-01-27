@@ -1,5 +1,5 @@
 # ui_calendar.py
-# V25.0 - UI: 完整参会人 + 底部一键复制 + 移除导出/链接
+# V27.3 - UI: 替换爱心图标为摄像机 + 保留颜色区分
 import sqlite3
 import re
 import os
@@ -54,7 +54,6 @@ class EventCard(QFrame):
         self.uid = uid; self.summary = summary; self.desc = desc; self.ai_summary_text = ai_summary
         self.sender_val = sender; self.recipient_val = recipient; self.start_val = start
         
-        # 强制内联样式
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setStyleSheet("""
             QFrame {
@@ -71,10 +70,9 @@ class EventCard(QFrame):
         
         layout = QVBoxLayout(self); layout.setContentsMargins(20, 20, 20, 20); layout.setSpacing(12)
 
-        # 1. 顶部：仅显示时间 (移除入会按钮)
+        # 1. 时间
         try: time_str = f"{start.split(' ')[1][:5]} - {end.split(' ')[1][:5]}"
         except: time_str = start
-        
         t_lbl = QLabel(time_str); t_lbl.setStyleSheet("color:#007AFF; font-weight:800; font-family:monospace; font-size:14px; border:none;")
         layout.addWidget(t_lbl)
 
@@ -83,8 +81,7 @@ class EventCard(QFrame):
         title.setStyleSheet("color:#1D1D1F; font-weight:700; font-size:16px; border:none; line-height:1.3;")
         layout.addWidget(title)
         
-        # 3. 人员 (🔥 完整显示，不省略)
-        # 清洗一下格式，去掉引号和尖括号
+        # 3. 人员
         s_clean = sender.split('<')[0].replace('"', '').strip()
         r_clean = recipient.replace('"', '').replace('<', '(').replace('>', ')')
         
@@ -95,10 +92,45 @@ class EventCard(QFrame):
         m_lbl.setStyleSheet("color:#666; font-size:12px; border:none; line-height:1.4; margin-top:4px;")
         layout.addWidget(m_lbl)
 
+        # 🔥🔥🔥 【入会按钮】 图标已换成 🎥 摄像机
+        join_info = self.extract_meeting_link(location, desc)
+        if join_info:
+            url, meeting_type = join_info
+            
+            # 默认
+            btn_text = "🎥  点击一键入会"
+            bg_color = "#007AFF" # 通用蓝
+            
+            if meeting_type == 'tencent':
+                btn_text = "🎥  腾讯会议 · 一键入会"  # 换成了摄像机图标
+                bg_color = "#0052D9" # 腾讯品牌色
+            elif meeting_type == 'teams':
+                btn_text = "🎥  Teams · 一键入会"    # 换成了摄像机图标
+                bg_color = "#6264A7" # Teams品牌色
+
+            self.btn_join = QPushButton(btn_text)
+            self.btn_join.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.btn_join.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: {bg_color};
+                    color: white;
+                    border: none;
+                    border-radius: 6px;
+                    padding: 8px;
+                    font-size: 13px;
+                    font-weight: bold;
+                    margin-top: 4px;
+                }}
+                QPushButton:hover {{ opacity: 0.9; }}
+            """)
+            self.btn_join.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(url)))
+            layout.addWidget(self.btn_join)
+        # 🔥🔥🔥
+
         line = QFrame(); line.setFixedHeight(1); line.setStyleSheet("background:#EFEFEF; margin: 4px 0;")
         layout.addWidget(line)
 
-        # 4. 纪要区 (移除导出，保留重置)
+        # 4. 纪要
         tool_row = QHBoxLayout(); tool_row.setSpacing(10)
         tool_row.addWidget(QLabel("📝 纪要笔记", styleSheet="font-weight:700; color:#444; font-size:13px; border:none;"))
         self.status_lbl = QLabel("已同步"); self.status_lbl.setStyleSheet("color:#CCC; font-size:11px; border:none;")
@@ -119,7 +151,7 @@ class EventCard(QFrame):
         else: self.reset_default_text(save=False)
         layout.addWidget(self.ed)
 
-        # 5. AI 胶囊
+        # 5. AI
         self.ai_capsule = QFrame(); self.ai_capsule.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.ai_capsule.setStyleSheet("QFrame { background-color: #F0F4FF; border: 1px solid #D6E4FF; border-radius: 8px; }")
         ai_layout = QVBoxLayout(self.ai_capsule); ai_layout.setContentsMargins(12, 10, 12, 10); ai_layout.setSpacing(6)
@@ -142,7 +174,7 @@ class EventCard(QFrame):
         
         layout.addWidget(self.ai_capsule)
 
-        # 6. 🔥 底部：一键复制大按钮
+        # 6. 一键复制
         self.btn_copy_all = QPushButton("📋 一键复制完整纪要")
         self.btn_copy_all.setCursor(Qt.CursorShape.PointingHandCursor)
         self.btn_copy_all.setStyleSheet("""
@@ -161,6 +193,29 @@ class EventCard(QFrame):
         """)
         self.btn_copy_all.clicked.connect(self.copy_full_minutes)
         layout.addWidget(self.btn_copy_all)
+
+    def extract_meeting_link(self, loc, desc):
+        if loc:
+            res = self.find_url(loc)
+            if res: return res
+        if desc:
+            res = self.find_url(desc)
+            if res: return res
+        return None
+
+    def find_url(self, text):
+        patterns = [
+            (r'(https?://teams\.microsoft\.com/[^\s<>"]+)', 'teams'),
+            (r'(https?://teams\.live\.com/[^\s<>"]+)', 'teams'),
+            (r'(https?://teams\.microsoftonline\.cn/[^\s<>"]+)', 'teams'),
+            (r'(https?://meeting\.tencent\.com/[^\s<>"]+)', 'tencent'),
+            (r'(https?://voovmeeting\.com/[^\s<>"]+)', 'tencent'),
+            (r'(https?://[a-zA-Z0-9-]+\.zoom\.us/[^\s<>"]+)', 'zoom')
+        ]
+        for pat, m_type in patterns:
+            match = re.search(pat, text)
+            if match: return (match.group(1), m_type)
+        return None
 
     def start_ai_generate(self):
         notes = self.ed.toPlainText()
@@ -190,7 +245,6 @@ class EventCard(QFrame):
         if save: self.auto_save()
 
     def copy_full_minutes(self):
-        # 1. 准备数据
         title = self.summary or "无主题"
         time = self.start_val
         s_clean = self.sender_val.split('<')[0].replace('"', '').strip()
@@ -199,7 +253,6 @@ class EventCard(QFrame):
         ai_sum = self.lbl_ai.text()
         if "点击生成" in ai_sum or "等待生成" in ai_sum: ai_sum = "(无 AI 总结)"
 
-        # 2. 格式化文本
         full_text = f"""【会议纪要】{title}
 --------------------------------
 📅 时间: {time}
@@ -211,15 +264,10 @@ class EventCard(QFrame):
 ✨ AI 总结:
 {ai_sum}
 """
-        # 3. 写入剪贴板
         QApplication.clipboard().setText(full_text)
-        
-        # 4. 按钮反馈
-        orig_text = self.btn_copy_all.text()
         self.btn_copy_all.setText("✅ 已复制到剪贴板")
         self.btn_copy_all.setStyleSheet("background-color: #34C759; color: white; font-size: 13px; font-weight: bold; border-radius: 8px; padding: 10px; border: none; margin-top: 8px;")
-        QThread.msleep(1000) # 简单延时展示
-        # 恢复样式 (注意：界面不会立即刷新，实际使用中通常配合 Timer 恢复，这里简化处理，下次点击会重置)
+        QThread.msleep(1000) 
         
     def auto_save(self):
         self.status_lbl.setText("保存中...")
